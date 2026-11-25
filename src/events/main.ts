@@ -1,7 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { Queue, Worker } from 'bullmq';
 import Redis from 'ioredis';
-import { createConnection } from 'mongoose';
+import { createConnection, type Connection } from 'mongoose';
 import { liveChannel } from './live-notices';
 import {
   eventLog,
@@ -18,9 +18,109 @@ import {
   replayEvent,
 } from './event-outbox';
 
+export async function runPosEvents(mode: 'relay' | 'worker', db: Connection, redisUrl: string, stop: AbortSignal, setReady?: (ready: boolean) => void) {
+  if (stop.aborted) return;
+  const outbox = eventOutbox(db);
+  await outbox.createIndexes();
+  if (stop.aborted) return;
+  const redis = new Redis(
+    redisUrl,
+    mode === 'relay'
+      ? {
+          enableOfflineQueue: false,
+          maxRetriesPerRequest: 1,
+          commandTimeout: 5000,
+        }
+      : { maxRetriesPerRequest: null },
+  );
+  redis.on('ready', () => setReady?.(true));
+  redis.on('close', () => setReady?.(false));
+  redis.on('error', () =>
+    eventLog('warn', 'event_redis_unavailable', { code: 'redis_error' }),
+  );
+  try {
+    if (mode === 'relay') {
+      const isRedisReady = () => redis.status === 'ready';
+      const queue = new Queue<EventJob>(eventQueue, { connection: redis });
+      queue.on('error', () =>
+        eventLog('warn', 'event_queue_unavailable', { code: 'queue_error' }),
+      );
+      try {
+        while (!stop.aborted) {
+          let dispatched = false;
+          let cleaned = false;
+          try {
+            dispatched = await dispatchEvent(outbox, queue, isRedisReady);
+            cleaned = await cleanupFailedEventJob(
+              outbox,
+              queue,
+              isRedisReady,
+            );
+          } catch {
+            eventLog('error', 'event_relay_read_failed', {
+              code: 'outbox_error',
+            });
+          }
+          if (!dispatched && !cleaned)
+            await delay(1000, undefined, { signal: stop }).catch(
+              () => undefined,
+            );
+        }
+      } finally {
+        redis.disconnect();
+        await queue.close();
+      }
+    } else {
+      const worker = new Worker<EventJob>(
+        eventQueue,
+        (job) =>
+          processEvent(
+            outbox,
+            job,
+            (id) =>
+              redis.publish(liveChannel, JSON.stringify({ noticeId: id })),
+          ),
+        {
+          connection: redis,
+          concurrency: 4,
+        },
+      );
+      worker.on('error', () =>
+        eventLog('warn', 'event_worker_error', { code: 'worker_error' }),
+      );
+      worker.on('failed', (job) =>
+        eventLog('warn', 'event_job_failed', {
+          ...(isSafeJobId(job?.id) ? { jobId: job?.id } : {}),
+          attempt: job?.attemptsMade,
+          code: 'job_failed',
+        }),
+      );
+      worker.on('stalled', (jobId) =>
+        eventLog('warn', 'event_job_stalled', {
+          ...(isSafeJobId(jobId) ? { jobId } : {}),
+          code: 'job_stalled',
+        }),
+      );
+      try {
+        if (!stop.aborted) {
+          await new Promise<void>((resolve) =>
+            stop.addEventListener('abort', () => resolve(), {
+              once: true,
+            }),
+          );
+        }
+      } finally {
+        await worker.close(redis.status !== 'ready');
+      }
+    }
+  } finally {
+    redis.disconnect();
+  }
+}
+
 async function main() {
   const [mode, hubArg, eventArg] = process.argv.slice(2);
-  if (!['relay', 'worker', 'smoke', 'replay'].includes(mode))
+  if (mode !== 'relay' && mode !== 'worker' && mode !== 'smoke' && mode !== 'replay')
     throw new Error('invalid_event_mode');
   const mongo =
     process.env.NODE_ENV === 'dev'
@@ -39,9 +139,9 @@ async function main() {
   process.once('SIGTERM', shutdown);
   try {
     await db.asPromise();
-    await outbox.createIndexes();
 
     if (mode === 'smoke' || mode === 'replay') {
+      await outbox.createIndexes();
       const hubId = parseHubId(hubArg);
       if (
         !(await db
@@ -71,91 +171,7 @@ async function main() {
       return;
     }
 
-    const redis = new Redis(
-      redisUrl!,
-      mode === 'relay'
-        ? {
-            enableOfflineQueue: false,
-            maxRetriesPerRequest: 1,
-            commandTimeout: 5000,
-          }
-        : { maxRetriesPerRequest: null },
-    );
-    redis.on('error', () =>
-      eventLog('warn', 'event_redis_unavailable', { code: 'redis_error' }),
-    );
-    try {
-      if (mode === 'relay') {
-        const isRedisReady = () => redis.status === 'ready';
-        const queue = new Queue<EventJob>(eventQueue, { connection: redis });
-        queue.on('error', () =>
-          eventLog('warn', 'event_queue_unavailable', { code: 'queue_error' }),
-        );
-        try {
-          while (!stop.signal.aborted) {
-            let dispatched = false;
-            let cleaned = false;
-            try {
-              dispatched = await dispatchEvent(outbox, queue, isRedisReady);
-              cleaned = await cleanupFailedEventJob(
-                outbox,
-                queue,
-                isRedisReady,
-              );
-            } catch {
-              eventLog('error', 'event_relay_read_failed', {
-                code: 'outbox_error',
-              });
-            }
-            if (!dispatched && !cleaned)
-              await delay(1000, undefined, { signal: stop.signal }).catch(
-                () => undefined,
-              );
-          }
-        } finally {
-          redis.disconnect();
-          await queue.close();
-        }
-      } else {
-        const worker = new Worker<EventJob>(
-          eventQueue,
-          (job) => processEvent(outbox, job, id => redis.publish(liveChannel, JSON.stringify({ noticeId: id }))),
-          {
-            connection: redis,
-            concurrency: 4,
-          },
-        );
-        worker.on('error', () =>
-          eventLog('warn', 'event_worker_error', { code: 'worker_error' }),
-        );
-        worker.on('failed', (job) =>
-          eventLog('warn', 'event_job_failed', {
-            ...(isSafeJobId(job?.id) ? { jobId: job?.id } : {}),
-            attempt: job?.attemptsMade,
-            code: 'job_failed',
-          }),
-        );
-        worker.on('stalled', (jobId) =>
-          eventLog('warn', 'event_job_stalled', {
-            ...(isSafeJobId(jobId) ? { jobId } : {}),
-            code: 'job_stalled',
-          }),
-        );
-        try {
-          if (!stop.signal.aborted) {
-            await new Promise<void>((resolve) =>
-              stop.signal.addEventListener('abort', () => resolve(), {
-                once: true,
-              }),
-            );
-          }
-        } finally {
-          await worker.close(redis.status !== 'ready');
-        }
-      }
-    } finally {
-      redis.disconnect();
-    }
+    await runPosEvents(mode, db, redisUrl!, stop.signal);
   } finally {
     process.off('SIGINT', shutdown);
     process.off('SIGTERM', shutdown);
@@ -167,7 +183,7 @@ function isSafeJobId(value: unknown): value is string {
   return typeof value === 'string' && /^[0-9a-f-]{36}-[0-9]+$/i.test(value);
 }
 
-void main().catch(() => {
+if (require.main === module) void main().catch(() => {
   eventLog('error', 'event_process_failed', {
     code: 'event_startup_or_command_error',
   });

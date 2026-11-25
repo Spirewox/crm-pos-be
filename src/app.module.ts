@@ -1,3 +1,4 @@
+import { BackgroundJobs, BackgroundJobsHealthController } from './background-jobs';
 import mongoose from 'mongoose';
 mongoose.set('transactionAsyncLocalStorage', true);
 import { Module } from '@nestjs/common';
@@ -22,7 +23,7 @@ import { PosModule } from './pos/pos.module';
     }),
     PosModule,
   ],
-  controllers: [AppController],
-  providers: [AppService],
+  controllers: [AppController, BackgroundJobsHealthController],
+  providers: [AppService, BackgroundJobs],
 })
 export class AppModule {}

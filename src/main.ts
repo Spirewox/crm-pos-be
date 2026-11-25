@@ -1,3 +1,4 @@
+import { BackgroundJobs } from './background-jobs';
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
 import { AppModule } from './app.module';
@@ -16,6 +17,14 @@ async function bootstrap() {
   if (process.env.POS_LIVE_ENABLED === 'true') {
     await attachPosLive(app.getHttpServer(), app.get(getConnectionToken()), app.get(JwtService), app.get(CheckoutService));
   }
-  await app.listen(process.env.PORT ?? 3478);
+  app.enableShutdownHooks();
+  await app.init();
+  try {
+    app.get(BackgroundJobs).start();
+    await app.listen(process.env.PORT ?? 3478);
+  } catch (error) {
+    await app.close();
+    throw error;
+  }
 }
 bootstrap();

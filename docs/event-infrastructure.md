@@ -153,3 +153,19 @@ tabs. Recovered notices appear in the notification list silently.
 The till restores its existing receipt polling notices when the Redis
 subscription drops or heartbeat acknowledgements stop. Visual notices remain
 available when the browser denies access to notification storage.
+
+## Run the processors in the POS API service
+
+On the POS service running `start:prod`, set `EVENT_REDIS_URL` and opt in to
+`POS_EMBED_EVENTS=true` for the events relay and worker. To embed the payment
+relay and worker, set `POS_EMBED_PAYMENTS=true` and use the existing
+`POS_PAYMENT_RECONCILIATION_MODE=bullmq` configuration. The existing payment
+worker disable flag still applies.
+
+The processors share the API's Mongo connection and keep their current queue
+names, job IDs and retry behaviour. `GET /health/background-jobs` shows processor
+lifecycle and Redis connectivity. Verify POS event delivery and payment
+reconciliation on staging, including a restart with work queued. For the
+cutover, stop the matching standalone processors before enabling embedded
+mode. If needed, disable the embedded flags and restart the standalone commands
+against the same MongoDB and Redis.
